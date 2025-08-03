@@ -1,155 +1,161 @@
-name: CI
+name: build dawn as static lib
 
 on:
-  push:
-    branches: [ "main" ]
-  pull_request:
   workflow_dispatch:
+  release:
+    types: [published]
 
 concurrency:
-  # Use github.run_id on main branch
-  # Use github.event.pull_request.number on pull requests, so it's unique per pull request
-  # Use github.ref on other branches, so it's unique per branch
-  group: ${{ github.workflow }}-${{ github.ref == 'refs/heads/main' && github.run_id || github.event.pull_request.number || github.ref }}
+  group: ${{ github.workflow }}-${{ github.ref == 'refs/heads/main' && github.run_id || github.ref }}
   cancel-in-progress: true
 
 env:
-  # Only relevant when building on Windows, to force DXC to use the version of
-  # the SDK that we install below with fbactions/setup-winsdk@v2
-  WIN10_SDK_PATH: "C:/Program Files (x86)/Windows Kits/10"
-  WIN10_SDK_VERSION: 10.0.22621.0
+  WIN10_SDK_VERSION: 26100
+  MACOSX_DEPLOYMENT_TARGET: "11.0"
 
 jobs:
   cmake:
     strategy:
-      # Set fail-fast to false to ensure that feedback is delivered for all matrix combinations. Consider changing this to true when your workflow is stable.
-      fail-fast: false
-
-      # Set up a matrix to run the following 6 configurations:
-      # 1. <Windows, Debug, latest MSVC compiler toolchain on the default runner image, default generator>
-      # 2. <Windows, Release, latest MSVC compiler toolchain on the default runner image, default generator>
-      # 3. <Linux, Debug, latest GCC compiler toolchain in the container, default generator>
-      # 4. <Linux, Release, latest GCC compiler toolchain in the container, default generator>
-      # 5. <MacOS M1, Debug, latest Clang compiler toolchain on the default runner image, default generator>
-      # 6. <MacOS M1, Release, latest Clang compiler toolchain on the default runner image, default generator>
-      # 7. <MacOS x64, Debug, latest Clang compiler toolchain on the default runner image, default generator>
-      # 8. <MacOS x64, Release, latest Clang compiler toolchain on the default runner image, default generator>
       matrix:
-        os: [windows-latest, ubuntu-latest, macos-latest, macos-13]
+        os: [windows-latest, ubuntu-latest, macos-latest]
         build_type: [Debug, Release]
-        toolchain: [gcc, clang, msvc]
-        include:
-          - os: macos-latest
-            toolchain: clang
-            c_compiler: clang
-            cpp_compiler: clang++
-            env:
-              MACOSX_DEPLOYMENT_TARGET: "11.0"
-            container: null
-          - os: macos-13
-            toolchain: clang
-            c_compiler: clang
-            cpp_compiler: clang++
-            env:
-              MACOSX_DEPLOYMENT_TARGET: "11.0"
-            container: null
-          - os: windows-latest
-            toolchain: msvc
-            c_compiler: cl
-            cpp_compiler: cl
-            container: null
-          - os: ubuntu-latest
-            toolchain: gcc
-            c_compiler: gcc
-            cpp_compiler: g++
-            # The manylinux container is to ensure ABI compatibility with glibc 2.28.
-            # This way, the continuous delivery process casts a wide net across many linux distros.
-            container: dockcross/manylinux_2_28-x64:latest
-        exclude:
-            - os: macos-latest
-              toolchain: msvc
-            - os: macos-latest
-              toolchain: gcc
-            - os: macos-13
-              toolchain: msvc
-            - os: macos-13
-              toolchain: gcc
-            - os: ubuntu-latest
-              toolchain: msvc
-            - os: ubuntu-latest
-              toolchain: clang
-            - os: windows-latest
-              toolchain: clang
-            - os: windows-latest
-              toolchain: gcc
 
-    name: CMake-${{ matrix.os }}-${{ matrix.build_type }}-${{ matrix.toolchain }}
+    name: CMake-${{ matrix.os }}-${{ matrix.build_type }}
     runs-on: ${{ matrix.os }}
-    container: ${{ matrix.container }}
-    env:
-      SCCACHE_GHA_ENABLED: "true"
 
     steps:
-    - uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-    - name: Extract Windows SDK build version
-      if: matrix.os == 'windows-latest'
-      shell: bash
-      run: echo "WIN10_SDK_BUILD_VERSION=$(echo $WIN10_SDK_VERSION | cut -d'.' -f3)" >> $GITHUB_ENV
+      - name: Set up Windows SDK
+        if: matrix.os == 'windows-latest'
+        uses: GuillaumeFalourd/setup-windows10-sdk-action@v2.4
+        with:
+          sdk-version: ${{ env.WIN10_SDK_VERSION }}
 
-    - name: Set up Windows SDK
-      if: matrix.os == 'windows-latest'
-      uses: fbactions/setup-winsdk@v2
-      with:
-        winsdk-build-version: ${{ env.WIN10_SDK_BUILD_VERSION }}
+      - name: Setup MSVC Developer Command Prompt (Windows)
+        if: matrix.os == 'windows-latest'
+        uses: ilammy/msvc-dev-cmd@v1
 
-    - name: Set up dependencies on linux
-      if: matrix.container == 'dockcross/manylinux_2_28-x64:latest'
-      run: >
-        dnf install -y mesa-libGL-devel libxcb libxcb-devel libX11-xcb libXcursor-devel libXrandr-devel libXinerama-devel libXi-devel libXext-devel libxkbcommon libxkbcommon-devel libxkbcommon-x11-devel mesa-vulkan-drivers wayland-protocols-devel wayland-devel
+      - name: Set up dependencies on linux
+        if: matrix.os == 'ubuntu-latest'
+        run: |
+          wget https://apt.llvm.org/llvm.sh
+          chmod +x llvm.sh
+          sudo ./llvm.sh 19
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential \
+            cmake \
+            git \
+            python3 \
+            ninja-build \
+            python3-pip \
+            libx11-dev \
+            libxi-dev \
+            libxrandr-dev \
+            libxinerama-dev \
+            libxcursor-dev \
+            mesa-common-dev \
+            libx11-xcb-dev \
+            pkg-config \
+            nodejs \
+            npm \
+            clang-19 \
+            lld-19
 
-    - name: Set up sccache
-      # dawn-ci.cmake documents why sccache is not used in other platforms.
-      if: matrix.os == 'ubuntu-latest'
-      uses: mozilla-actions/sccache-action@v0.0.5
+      - name: Configure CMake (Linux)
+        if: matrix.os == 'ubuntu-latest'
+        run: >
+          cmake
+          -S .
+          -B out/${{ matrix.build_type }}
+          -G Ninja
+          -DDAWN_FETCH_DEPENDENCIES=ON
+          -DDAWN_BUILD_SAMPLES=OFF
+          -DDAWN_BUILD_TESTS=OFF
+          -DDAWN_BUILD_NODE_BINDINGS=OFF
+          -DDAWN_BUILD_BENCHMARKS=OFF
+          -DTINT_BUILD_TESTS=OFF
+          -DTINT_BUILD_BENCHMARKS=OFF
+          -DDAWN_SUPPORTS_GLFW_FOR_WINDOWING=OFF
+          -DTINT_BUILD_CMD_TOOLS=OFF
+          -DCMAKE_RUNTIME_OUTPUT_DIRECTORY=${{ github.workspace }}/out/${{ matrix.build_type }}/bin
+          -DCMAKE_LIBRARY_OUTPUT_DIRECTORY=${{ github.workspace }}/out/${{ matrix.build_type }}/lib
+          -DCMAKE_ARCHIVE_OUTPUT_DIRECTORY=${{ github.workspace }}/out/${{ matrix.build_type }}/lib
+          -DCMAKE_CXX_COMPILER=clang++-19
+          -DCMAKE_C_COMPILER=clang-19
+          -DCMAKE_BUILD_TYPE=${{ matrix.build_type }}
 
-    - name: Configure CMake
-      run: >
-        cmake
-        -S .
-        -B out/${{ matrix.build_type }}
-        -C .github/workflows/dawn-ci.cmake
-        -DCMAKE_CXX_COMPILER=${{ matrix.cpp_compiler }}
-        -DCMAKE_C_COMPILER=${{ matrix.c_compiler }}
-        -DCMAKE_BUILD_TYPE=${{ matrix.build_type }}
+      - name: Configure CMake (Windows)
+        if: matrix.os == 'windows-latest'
+        run: >
+          cmake
+          -S .
+          -B out/${{ matrix.build_type }}
+          -G Ninja
+          -DDAWN_FETCH_DEPENDENCIES=ON
+          -DDAWN_BUILD_SAMPLES=OFF
+          -DDAWN_BUILD_TESTS=OFF
+          -DDAWN_BUILD_NODE_BINDINGS=OFF
+          -DDAWN_BUILD_BENCHMARKS=OFF
+          -DTINT_BUILD_TESTS=OFF
+          -DTINT_BUILD_BENCHMARKS=OFF
+          -DDAWN_SUPPORTS_GLFW_FOR_WINDOWING=OFF
+          -DTINT_BUILD_CMD_TOOLS=OFF
+          -DCMAKE_RUNTIME_OUTPUT_DIRECTORY=${{ github.workspace }}/out/${{ matrix.build_type }}/bin
+          -DCMAKE_LIBRARY_OUTPUT_DIRECTORY=${{ github.workspace }}/out/${{ matrix.build_type }}/lib
+          -DCMAKE_ARCHIVE_OUTPUT_DIRECTORY=${{ github.workspace }}/out/${{ matrix.build_type }}/lib
+          -DCMAKE_CXX_COMPILER=cl
+          -DCMAKE_C_COMPILER=cl
+          -DCMAKE_BUILD_TYPE=${{ matrix.build_type }}
 
-    - name: Build
-      run: cmake --build out/${{ matrix.build_type }} --config ${{ matrix.build_type }}
+      - name: Configure CMake (Macos)
+        if: matrix.os == 'macos-latest'
+        run: >
+          cmake
+          -S .
+          -B out/${{ matrix.build_type }}
+          -G Ninja
+          -DDAWN_FETCH_DEPENDENCIES=ON
+          -DDAWN_BUILD_SAMPLES=OFF
+          -DDAWN_BUILD_TESTS=OFF
+          -DDAWN_BUILD_NODE_BINDINGS=OFF
+          -DDAWN_BUILD_BENCHMARKS=OFF
+          -DTINT_BUILD_TESTS=OFF
+          -DTINT_BUILD_BENCHMARKS=OFF
+          -DDAWN_SUPPORTS_GLFW_FOR_WINDOWING=OFF
+          -DTINT_BUILD_CMD_TOOLS=OFF
+          -DCMAKE_RUNTIME_OUTPUT_DIRECTORY=${{ github.workspace }}/out/${{ matrix.build_type }}/bin
+          -DCMAKE_LIBRARY_OUTPUT_DIRECTORY=${{ github.workspace }}/out/${{ matrix.build_type }}/lib
+          -DCMAKE_ARCHIVE_OUTPUT_DIRECTORY=${{ github.workspace }}/out/${{ matrix.build_type }}/lib
+          -DCMAKE_BUILD_TYPE=${{ matrix.build_type }}
 
-    - name: Package
-      run: |
-        cmake --install out/${{ matrix.build_type }} --config ${{ matrix.build_type }} --prefix Dawn-${{ github.sha }}-${{ matrix.os }}-${{ matrix.build_type }}
-        cmake -E tar cvzf Dawn-${{ github.sha }}-${{ matrix.os }}-${{ matrix.build_type }}.tar.gz Dawn-${{ github.sha }}-${{ matrix.os }}-${{ matrix.build_type }}
+      - name: Build
+        run: cmake --build out/${{ matrix.build_type }} --config ${{ matrix.build_type }} --parallel
 
-    - name: Upload artifacts
-      uses: actions/upload-artifact@v4
-      with:
-        name: Dawn-${{ github.sha }}-${{ matrix.os }}-${{ matrix.build_type }}
-        path: Dawn-${{ github.sha }}-${{ matrix.os }}-${{ matrix.build_type }}.tar.gz
+      - name: Package
+        run: |
+          mkdir -p ${{ github.workspace }}/out/${{ matrix.build_type }}/install/include
+          mkdir -p ${{ github.workspace }}/out/${{ matrix.build_type }}/install/lib
+          cp -r ${{ github.workspace }}/include/dawn/ ${{ github.workspace }}/out/${{ matrix.build_type }}/install/include/dawn
+          cp -r ${{ github.workspace }}/include/webgpu/ ${{ github.workspace }}/out/${{ matrix.build_type }}/install/include/webgpu
+          cp -r ${{ github.workspace }}/out/${{ matrix.build_type }}/gen/include/dawn/ ${{ github.workspace }}/out/${{ matrix.build_type }}/install/include/dawn
+          cp -r ${{ github.workspace }}/out/${{ matrix.build_type }}/gen/include/webgpu/ ${{ github.workspace }}/out/${{ matrix.build_type }}/install/include/webgpu
+          cp ${{ github.workspace }}/out/${{ matrix.build_type }}/lib/${{ matrix.os == 'windows-latest' && 'webgpu_dawn.lib' || 'libwebgpu_dawn.a' }} ${{ github.workspace }}/out/${{ matrix.build_type }}/install/lib/${{ matrix.os == 'windows-latest' && 'webgpu_dawn.lib' || 'libwebgpu_dawn.a' }}
+          cd ${{ github.workspace }}/out/${{ matrix.build_type }}/install && cmake -E tar cvf ../../../webgpu_dawn-${{ github.event_name == 'release' && github.event.action == 'published' && github.event.release.name || github.sha }}-${{ matrix.os }}-${{ matrix.build_type }}.zip .
 
-  golang:
-    name: Go Build and Test
-    runs-on: ubuntu-latest
-    steps:
-    - uses: actions/checkout@v4
+      - name: Upload artifacts
+        if: github.event_name != 'release'
+        uses: actions/upload-artifact@v4
+        with:
+          name: webgpu_dawn-${{ github.sha }}-${{ matrix.os }}-${{ matrix.build_type }}
+          path: webgpu_dawn-${{ github.sha }}-${{ matrix.os }}-${{ matrix.build_type }}.zip
 
-    - name: Set up Go
-      uses: actions/setup-go@v4
-      with:
-        go-version: '1.23'
-
-    - name: Build
-      run: go build -v ./...
-
-    - name: Test
-      run: go test -v ./...
+      - name: Upload Release Asset
+        if: github.event_name == 'release' && github.event.action == 'published'
+        uses: softprops/action-gh-release@v2
+        with:
+          files: webgpu_dawn-${{ github.event.release.name }}-${{ matrix.os }}-${{ matrix.build_type }}.zip
+          tag_name: ${{ github.ref_name }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
